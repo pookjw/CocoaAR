@@ -7,6 +7,10 @@
 
 import Cocoa
 import RealityKit
+import QuickLookUI
+import ObjectiveC
+
+@MainActor fileprivate let urlsKey: UnsafeMutableRawPointer = .allocate(byteCount: 1, alignment: 1)
 
 @MainActor
 final class PreviewViewController: NSViewController {
@@ -20,6 +24,11 @@ final class PreviewViewController: NSViewController {
     @IBOutlet @ViewLoading private var heightTextField: NSTextField
     @IBOutlet @ViewLoading private var depthTextField: NSTextField
     @ViewLoading private var boxEntity: ModelEntity
+    private var poseImagesTask: Task<Void, Never>?
+    
+    deinit {
+        poseImagesTask?.cancel()
+    }
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -76,10 +85,55 @@ final class PreviewViewController: NSViewController {
         
         //
         
-        for (index, url) in poses.urlsBySample {
-            let pose: PhotogrammetrySession.Pose = poses.posesBySample[index]!
-            
-            
+        let poses: PhotogrammetrySession.Poses = poses
+        let scene: Scene = myARView.scene
+        let poseImagesAnchor: AnchorEntity = .init(world: .zero)
+        
+        scene.addAnchor(poseImagesAnchor)
+        
+        // do not capture `self`!
+        poseImagesTask = .init { @MainActor in
+            await withDiscardingTaskGroup { group in
+                for (index, url) in poses.urlsBySample {
+                    guard let pose: PhotogrammetrySession.Pose = poses.posesBySample[index] else {
+                        print("Skipped: \(index)")
+                        return
+                    }
+                    
+                    group.addTask {
+                        let image: NSImage = .init(contentsOf: url)!
+                        
+                        let textureResource: TextureResource = try! await TextureResource
+                            .generateAsync(
+                                from: image.cgImage(forProposedRect: nil, context: nil, hints: nil)!,
+                                options: .init(semantic: .raw)
+                            )
+                            .values
+                            .first { _ in true }!
+                        
+                        await MainActor.run {
+                            var material: UnlitMaterial = .init()
+                            material.color = .init(tint: .white, texture: .init(textureResource))
+                            
+                            let poseImageEntity: ModelEntity = .init(
+                                mesh: .generateBox(width: 0.1, height: 0.1, depth: .zero),
+                                materials: [
+                                    material
+                                ]
+                            )
+                            
+                            poseImageEntity.position = pose.translation
+                            poseImageEntity.transform = pose.transform
+                            poseImageEntity.transform.rotation = pose.rotation
+                            
+                            poseImageEntity.components.set(ImageURLComponent(fileURL: url))
+                            poseImageEntity.components.set(CollisionComponent(shapes: [.generateBox(width: 0.1, height: 0.1, depth: .zero)]))
+                            
+                            poseImagesAnchor.addChild(poseImageEntity)
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -159,4 +213,43 @@ final class PreviewViewController: NSViewController {
             removeFromParent()
         }
     }
+    
+    @IBAction private func clickGestureRecognizerDidTrigger(_ sender: NSClickGestureRecognizer) {
+        let location: NSPoint = sender.location(in: myARView)
+        
+        guard let entity: Entity = myARView.entity(at: location) else {
+            return
+        }
+        
+        guard let imageURLComponent: ImageURLComponent = entity.components[ImageURLComponent.self] else {
+            return
+        }
+        
+        let urls: [URL] = try! FileManager.default.contentsOfDirectory(at: imageURLComponent.fileURL.deletingLastPathComponent(), includingPropertiesForKeys: nil)
+        
+        let previewPanel: QLPreviewPanel = .shared()
+        
+        objc_setAssociatedObject(previewPanel, urlsKey, urls, .OBJC_ASSOCIATION_COPY_NONATOMIC)
+        
+        previewPanel.makeKeyAndOrderFront(nil)
+        previewPanel.dataSource = self
+        previewPanel.currentPreviewItemIndex = urls.firstIndex(of: imageURLComponent.fileURL)!
+        previewPanel.reloadData()
+    }
+}
+
+extension PreviewViewController: QLPreviewPanelDataSource {
+    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        let urls: [URL] = objc_getAssociatedObject(panel!, urlsKey) as! [URL]
+        return urls.count
+    }
+    
+    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> (any QLPreviewItem)! {
+        let urls: [URL] = objc_getAssociatedObject(panel!, urlsKey) as! [URL]
+        return urls[index] as NSURL
+    }
+}
+
+fileprivate struct ImageURLComponent: Component {
+    let fileURL: URL
 }
